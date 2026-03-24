@@ -1,8 +1,8 @@
-# Text-Driven UI Playback
+# Text-Driven UI Recorder/Player
+
 <video src="docs/video/debug_playback.mp4" controls playsinline preload="metadata" width="100%" style="max-width: 920px;"></video>
 
 This framework turns plain-text step lines into runnable tests:
-
 1. **Write steps** in YAML (or create a test with `init-test`). Steps use action keywords and optional variables.
 2. **Debug** opens an interactive UI to run steps one-by-one, add/edit steps, set breakpoints, and save.
 3. **Discovery** runs the flow in Playwright and records locators into a page object. Once it succeeds, the test is marked established.
