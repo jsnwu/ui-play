@@ -20,6 +20,8 @@ export interface UiplayBrowserConfig {
 
 export interface UiplayDebugUiConfig {
   sidePanelWidth: number;
+  /** When true, the app page shows a hover outline on interactive elements (buttons, links, inputs). Default true. */
+  highlightInteractiveElements: boolean;
 }
 
 export interface UiplayTimeoutsConfig {
@@ -81,6 +83,7 @@ const DEFAULT_CONFIG: UiplayConfig = {
   },
   debugUi: {
     sidePanelWidth: 800,
+    highlightInteractiveElements: true,
   },
   timeouts: {
     page: {

@@ -1,4 +1,4 @@
-import { chromium, Page } from "playwright";
+import { chromium, Locator, Page } from "playwright";
 import path from "path";
 import fs from "fs";
 const { marked } = require("marked") as { marked: (src: string) => string };
@@ -7,6 +7,7 @@ import { resolveLocator } from "./locator-resolver";
 import { loadTestCase, loadTestCaseFromContent, saveTestCase, listTestCases } from "./test-case-store";
 import { evaluateVariables, isFullUrl, resolveNavigateUrl, substitute } from "./substitute";
 import { getDebugRecorderScript } from "./debug-recorder-script";
+import { getInteractiveHighlightInitScript } from "./debug-highlight-script";
 import type { StepIntent, PlainTextTestCase, RecordedAction } from "./types";
 
 export interface DebugRunOptions {
@@ -56,6 +57,31 @@ interface DebugSessionState {
   logPanelVisible?: boolean;
   /** When set, Run button shows as Resume and continues from this step index (after stop/breakpoint/failure). */
   resumableFromIndex?: number;
+  /** Outline interactive elements on the app page on hover. Default true (see config.json debugUi). */
+  highlightInteractiveElements?: boolean;
+}
+
+async function syncHighlightToAllFrames(appPage: Page, state: DebugSessionState): Promise<void> {
+  const enabled = state.highlightInteractiveElements !== false;
+  for (const frame of appPage.frames()) {
+    try {
+      await frame.evaluate(
+        (e) => {
+          const w = window as Window & {
+            __UPLAY_HL_ENABLED_GLOBAL?: boolean;
+            __uiplaySetHighlightEnabled?: (v: boolean) => void;
+          };
+          w.__UPLAY_HL_ENABLED_GLOBAL = e;
+          if (typeof w.__uiplaySetHighlightEnabled === "function") {
+            w.__uiplaySetHighlightEnabled(e);
+          }
+        },
+        enabled
+      );
+    } catch {
+      // cross-origin frame or document not ready
+    }
+  }
 }
 
 /**
@@ -99,6 +125,7 @@ export async function runDebug(options: DebugRunOptions): Promise<void> {
     enabled: true,
   }));
 
+  const highlightCfg = getUiplayConfig().debugUi.highlightInteractiveElements;
   const state: DebugSessionState = {
     test,
     baseUrl: sessionBaseUrlRaw,
@@ -110,6 +137,7 @@ export async function runDebug(options: DebugRunOptions): Promise<void> {
     recordedCount: 0,
     logs: [],
     logPanelVisible: false,
+    highlightInteractiveElements: highlightCfg !== false,
   };
 
   const contextOptions = await getPlaywrightBrowserContextOptions();
@@ -129,6 +157,20 @@ export async function runDebug(options: DebugRunOptions): Promise<void> {
 
   const appPage = await appContext.newPage();
   const uiPage = await uiContext.newPage();
+
+  const hlScript = getInteractiveHighlightInitScript();
+  await appPage.addInitScript({ content: hlScript });
+  try {
+    await appPage.evaluate((code: string) => {
+      (0, eval)(code);
+    }, hlScript);
+  } catch {
+    // ignore if main frame cannot eval yet
+  }
+  await syncHighlightToAllFrames(appPage, state);
+  appPage.on("framenavigated", () => {
+    void syncHighlightToAllFrames(appPage, state);
+  });
 
   // When the debug UI window/tab is closed, close the browser and terminate the process.
   uiPage.on("close", () => {
@@ -207,6 +249,14 @@ export async function runDebug(options: DebugRunOptions): Promise<void> {
       }
       if (cmd.type === "toggle-log") {
         state.logPanelVisible = !state.logPanelVisible;
+        return { ok: true };
+      }
+      if (cmd.type === "toggle-highlight-interactive") {
+        const p = payload as { enabled?: boolean };
+        if (typeof p.enabled === "boolean") {
+          state.highlightInteractiveElements = p.enabled;
+          await syncHighlightToAllFrames(appPage, state);
+        }
         return { ok: true };
       }
       if (busy) return { ok: false, error: "Runner is busy; try again shortly." };
@@ -835,6 +885,45 @@ async function renderDebugUI(page: Page, state: DebugSessionState): Promise<void
       button { font-size: 13px; padding: 1px 4px; }
       button:disabled { opacity: 0.5; cursor: default; }
       .toolbar { margin-bottom: 0; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+      /* Checkbox affordance: empty box off, box + green check when on */
+      .toolbar-highlight-btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 1px 4px;
+        font-size: 13px;
+      }
+      .toolbar-highlight-btn .highlight-checkbox {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
+      }
+      .toolbar-highlight-btn .highlight-box {
+        display: inline-block;
+        width: 12px;
+        height: 12px;
+        border: 1px solid #555;
+        border-radius: 2px;
+        background: #fff;
+        box-sizing: border-box;
+        position: relative;
+        vertical-align: middle;
+      }
+      .toolbar-highlight-btn .highlight-box.checked {
+        border-color: #16a34a;
+      }
+      .toolbar-highlight-btn .highlight-box.checked::after {
+        content: "\\2713";
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        transform: translate(-50%, -58%);
+        font-size: 10px;
+        font-weight: 700;
+        color: #16a34a;
+        line-height: 1;
+      }
       .log-toggle-icon { font-size: 10px; color: #888; }
       button[data-role="toggle-log"]:hover .log-toggle-icon { color: #333; }
       button[data-role="stop"] { display: inline-flex; align-items: center; }
@@ -1106,6 +1195,17 @@ ${variablesSectionHtml}
         <button data-role="record" id="record-toggle" onclick="toggleRecord()">Record</button>      
         <button data-role="save-test" onclick="saveTest()">Save</button>
         <button data-role="reset" onclick="resetSession()">Reset</button>
+        <button
+          type="button"
+          id="highlight-interactive-btn"
+          class="toolbar-highlight-btn"
+          aria-pressed="${state.highlightInteractiveElements !== false ? "true" : "false"}"
+          title="Toggle outline on interactive elements (hover + playback). Click to turn on or off."
+          data-role="toggle-highlight"
+          onclick="toggleHighlightInteractive()"
+        >
+          <span class="highlight-checkbox" aria-hidden="true"><span class="highlight-box${state.highlightInteractiveElements !== false ? " checked" : ""}"></span></span>Highlight
+        </button>
         <button data-role="toggle-log" onclick="toggleLogPanel()">Log <span class="log-toggle-icon">${state.logPanelVisible ? "▼" : "▶"}</span></button>
         <button data-role="open-readme" onclick="openReadme()" title="Open README">?</button>
         <span id="save-message" class="save-message" style="display: ${state.saveMessageVisible ? "inline" : "none"}">${state.saveMessageVisible ? "Saved successfully." : ""}</span>
@@ -1530,7 +1630,10 @@ ${rowsHtml}
             const role = btn.getAttribute("data-role");
             // While recording, only allow: Stop recording (record), Log, and ? (open-readme).
             const allowed =
-              role === "record" || role === "toggle-log" || role === "open-readme";
+              role === "record" ||
+              role === "toggle-log" ||
+              role === "toggle-highlight" ||
+              role === "open-readme";
             if (!allowed) btn.disabled = true;
           });
           setStepPlaybackButtonsDisabled(true);
@@ -1717,6 +1820,17 @@ ${rowsHtml}
               : "";
           window.uiplayDebugControl({ type: "toggle-log", baseUrl });
         }
+      }
+
+      function toggleHighlightInteractive() {
+        const btn = document.getElementById("highlight-interactive-btn");
+        if (!btn || !(btn instanceof HTMLButtonElement) || !window.uiplayDebugControl) return;
+        const wasOn = btn.getAttribute("aria-pressed") === "true";
+        const next = !wasOn;
+        btn.setAttribute("aria-pressed", next ? "true" : "false");
+        const box = btn.querySelector(".highlight-box");
+        if (box) box.classList.toggle("checked", next);
+        window.uiplayDebugControl({ type: "toggle-highlight-interactive", enabled: next });
       }
 
       function openReadme() {
@@ -1955,6 +2069,7 @@ ${rowsHtml}
       window.deleteStep = deleteStep;
       window.addStep = addStep;
       window.toggleLogPanel = toggleLogPanel;
+      window.toggleHighlightInteractive = toggleHighlightInteractive;
       window.openReadme = openReadme;
       window.clearLog = clearLog;
       window.moveSelectedStepUp = moveSelectedStepUp;
@@ -2097,6 +2212,93 @@ async function runSingleStep(
     state.logPanelVisible = true;
     state.logs = state.logs ?? [];
     state.logs.push({ text: entry.lastError, isError: true });
+  }
+}
+
+const PLAYBACK_HIGHLIGHT_REMOVE_MS = 1200;
+
+/**
+ * Green box + center dot on the resolved element during debug playback (matches “click target” affordance).
+ * Uses overlay in the page; not Playwright’s default red inspector highlight.
+ */
+async function showGreenPlaybackHighlight(
+  loc: Locator,
+  raceStop: <T>(p: Promise<T>) => Promise<T>
+): Promise<void> {
+  const box = await raceStop(loc.boundingBox());
+  if (!box || box.width < 1 || box.height < 1) return;
+  const page = loc.page();
+  await raceStop(
+    page.evaluate(
+      ({
+        x,
+        y,
+        w,
+        h,
+        ms,
+      }: {
+        x: number;
+        y: number;
+        w: number;
+        h: number;
+        ms: number;
+      }) => {
+        const root = document.documentElement;
+        if (!root) return;
+        document.querySelectorAll("[data-uiplay-playback-highlight]").forEach((n) => n.remove());
+        const layer = document.createElement("div");
+        layer.setAttribute("data-uiplay-playback-highlight", "1");
+        layer.style.cssText =
+          "position:fixed;inset:0;pointer-events:none;z-index:2147483647;overflow:visible";
+        const boxEl = document.createElement("div");
+        boxEl.style.cssText =
+          "position:absolute;left:" +
+          x +
+          "px;top:" +
+          y +
+          "px;width:" +
+          w +
+          "px;height:" +
+          h +
+          "px;box-sizing:border-box;border:3px solid #22c55e;border-radius:4px;" +
+          "background:rgba(34,197,94,0.14);box-shadow:0 0 0 1px rgba(34,197,94,0.45)";
+        const dotR = 6;
+        const dot = document.createElement("div");
+        dot.style.cssText =
+          "position:absolute;left:" +
+          (x + w / 2 - dotR) +
+          "px;top:" +
+          (y + h / 2 - dotR) +
+          "px;width:" +
+          dotR * 2 +
+          "px;height:" +
+          dotR * 2 +
+          "px;border-radius:50%;background:#16a34a;border:2px solid #fff;" +
+          "box-shadow:0 1px 5px rgba(0,0,0,0.28)";
+        layer.appendChild(boxEl);
+        layer.appendChild(dot);
+        root.appendChild(layer);
+        setTimeout(() => layer.remove(), ms);
+      },
+      { x: box.x, y: box.y, w: box.width, h: box.height, ms: PLAYBACK_HIGHLIGHT_REMOVE_MS }
+    )
+  );
+}
+
+/**
+ * Outline the target element during debug playback (Run step / Run all).
+ * Pointer-move highlighting only runs for the user's mouse; automation needs this so clicks/fills are visible.
+ */
+async function highlightPlaybackTargetIfEnabled(
+  loc: Locator,
+  state: DebugSessionState,
+  raceStop: <T>(p: Promise<T>) => Promise<T>
+): Promise<void> {
+  if (state.highlightInteractiveElements === false) return;
+  try {
+    await showGreenPlaybackHighlight(loc, raceStop);
+  } catch {
+    // detached node, strict violation, etc.
   }
 }
 
@@ -2288,6 +2490,7 @@ async function executeStep(
           ? resolveUploadFilePath(substitute(nextStep!.value!, env))
           : "");
       if (filePath) {
+        await highlightPlaybackTargetIfEnabled(locForClick, state, raceStop);
         const [fileChooser] = await raceStop(
           Promise.all([
             page.waitForEvent("filechooser"),
@@ -2296,6 +2499,7 @@ async function executeStep(
         );
         await raceStop(fileChooser.setFiles(filePath));
       } else {
+        await highlightPlaybackTargetIfEnabled(locForClick, state, raceStop);
         await raceStop(locForClick.click());
       }
       if (progress) progress.actionPerformed = true;
@@ -2304,6 +2508,7 @@ async function executeStep(
     }
     case "dblclick": {
       const urlBeforeDblClick = await page.url();
+      await highlightPlaybackTargetIfEnabled(locForClick, state, raceStop);
       await raceStop(locForClick.dblclick());
       if (progress) progress.actionPerformed = true;
       await postClickNavigationSettle(urlBeforeDblClick);
@@ -2311,12 +2516,14 @@ async function executeStep(
     }
     case "fill": {
       const value = step.value ? substitute(step.value, env) : "";
+      await highlightPlaybackTargetIfEnabled(locForFill, state, raceStop);
       await raceStop(locForFill.fill(value));
       if (progress) progress.actionPerformed = true;
       break;
     }
     case "select": {
       const value = step.value ? substitute(step.value, env) : "";
+      await highlightPlaybackTargetIfEnabled(loc, state, raceStop);
       await raceStop(loc.selectOption(value));
       if (progress) progress.actionPerformed = true;
       break;
@@ -2345,6 +2552,7 @@ async function executeStep(
         );
         if (prevResolved) {
           const triggerLoc = prevResolved.clickLocator ?? prevResolved.locator;
+          await highlightPlaybackTargetIfEnabled(triggerLoc, state, raceStop);
           const [fileChooser] = await raceStop(
             Promise.all([
               page.waitForEvent("filechooser"),
@@ -2357,6 +2565,7 @@ async function executeStep(
       }
 
       // Fallback: visible <input type="file"> on the page.
+      await highlightPlaybackTargetIfEnabled(loc, state, raceStop);
       await raceStop(loc.waitFor({ state: "visible", timeout: timeouts.action.uploadVisibleMs }).catch(() => { }) as Promise<void>);
       const uploadInput = loc.locator('input[type="file"]').first();
       try {
@@ -2368,20 +2577,25 @@ async function executeStep(
       break;
     }
     case "hover":
+      await highlightPlaybackTargetIfEnabled(loc, state, raceStop);
       await raceStop(loc.hover());
       if (progress) progress.actionPerformed = true;
       break;
     case "press":
+      await highlightPlaybackTargetIfEnabled(loc, state, raceStop);
       await raceStop(loc.press(step.key ?? "Enter"));
       if (progress) progress.actionPerformed = true;
       break;
     case "assert_visible":
+      await highlightPlaybackTargetIfEnabled(loc, state, raceStop);
       await raceStop(loc.waitFor({ state: "visible", timeout: timeouts.action.assertVisibleMs }));
       break;
     case "assert_text":
+      await highlightPlaybackTargetIfEnabled(loc, state, raceStop);
       await raceStop(loc.waitFor({ state: "visible", timeout: timeouts.action.assertVisibleMs }));
       break;
     case "wait_enabled": {
+      await highlightPlaybackTargetIfEnabled(loc, state, raceStop);
       await raceStop(loc.waitFor({ state: "visible", timeout: timeouts.action.waitEnabledVisibleMs }));
       const enabledCheck = (el: Element) => {
         if (el.getAttribute("aria-selected") === "true") return true;

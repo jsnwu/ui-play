@@ -9,7 +9,8 @@
     "viewport": { "width": 1500, "height": 1100 }
   },
   "debugUi": {
-    "sidePanelWidth": 800
+    "sidePanelWidth": 800,
+    "highlightInteractiveElements": true
   },
   "timeouts": {
     "page": {

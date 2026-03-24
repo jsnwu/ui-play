@@ -1,11 +1,13 @@
 # Text-Driven UI Playback
+<video src="docs/video/debug_playback.mp4" controls playsinline preload="metadata" width="100%" style="max-width: 920px;"></video>
 
-This framework turns plain-text step lines into runnable Playwright tests:
+This framework turns plain-text step lines into runnable tests:
 
 1. **Write steps** in YAML (or create a test with `init-test`). Steps use action keywords and optional variables.
-2. **Discovery** runs the flow in Playwright and records locators into a page object. Once it succeeds, the test is marked established.
-3. **Run** executes established tests using page objects only (no exploration).
-4. **Debug** opens an interactive UI to run steps one-by-one, add/edit steps, set breakpoints, and save.
+2. **Debug** opens an interactive UI to run steps one-by-one, add/edit steps, set breakpoints, and save.
+3. **Discovery** runs the flow in Playwright and records locators into a page object. Once it succeeds, the test is marked established.
+4. **Run** executes established tests using page objects only (no exploration).
+
 
 ## Setup
 
@@ -88,7 +90,10 @@ Step lines are parsed by `parseStepLine` and formatted by `formatStepToLine` in 
 Existing `.json` test cases are still loaded if no `.yaml` exists for the same id.
 
 ## Debug mode
-In this mode, user is able to record and playback a script, add and modify indivdual action or playback the whole script
+
+In this mode, you can record and play back a script, add and modify individual actions, or run the whole script.
+
+
 ![Debug runner — interactive step runner with toolbar, steps table, and log panel](docs/images/debug_runner.png)
 
 Run **`npm run uiplay -- debug <testId>`** to open the interactive debug UI. You get:

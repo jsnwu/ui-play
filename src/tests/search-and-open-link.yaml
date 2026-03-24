@@ -6,6 +6,6 @@ test_case:
   actions:
     - Navigate to https://www.duckduckgo.com/
     - Click Search with DuckDuckGo dropdown with locator '#searchbox_input'
-    - Fill "Search with DuckDuckGo dropdown" with "claude code" with locator '#searchbox_input'
+    - Fill "Search with DuckDuckGo dropdown" with "Claude Code" with locator '#searchbox_input'
     - Click Search button
-    - Click Claude link
+    - Click Claude Code by Anthropic link
