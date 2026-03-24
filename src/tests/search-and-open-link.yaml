@@ -1,0 +1,11 @@
+test_case:
+  id: search-and-open-link
+  title: search and open a link
+  established: true
+  baseUrl: "{{ENV:BASE_URL}}"
+  actions:
+    - Navigate to https://www.duckduckgo.com/
+    - Click Search with DuckDuckGo dropdown with locator '#searchbox_input'
+    - Fill "Search with DuckDuckGo dropdown" with "claude code" with locator '#searchbox_input'
+    - Click Search button
+    - Click Claude link

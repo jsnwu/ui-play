@@ -1,0 +1,32 @@
+{
+  "name": "ui-play",
+  "version": "0.0.0",
+  "private": true,
+  "description": "UI Play - Text-Driven UI Playback",
+  "license": "UNLICENSED",
+  "scripts": {
+    "uiplay": "npx tsx src/cli.ts",
+    "uiplay:discovery": "npx tsx src/cli.ts discovery",
+    "uiplay:run": "npx tsx src/cli.ts run",
+    "uiplay:debug": "npx tsx src/cli.ts debug",
+    "uiplay:translate": "npx tsx src/cli.ts translate",
+    "uiplay:list": "npx tsx src/cli.ts list-tests",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "marked": "^15.0.0",
+    "yaml": "^2.7.0",
+    "jiti": "^2.6.1",
+    "openai": "^4.73.0",
+    "playwright": "^1.58.0",
+    "swagger-typescript-api": "^13.2.16"
+  },
+  "devDependencies": {
+    "@types/node": "^25.1.0",
+    "prettier": "^3.4.2",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

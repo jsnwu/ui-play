@@ -1,0 +1,8 @@
+id: home-page
+name: home-page
+urlPattern: https://duckduckgo.com/
+locators:
+  Search_with_DuckDuckGo_dropdown: "#searchbox_input"
+  Search_button: '[title*="Search"]'
+  Claude_link: '[title*="Claude"]'
+updatedAt: 2026-03-24T19:59:11.730Z

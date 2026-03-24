@@ -1,0 +1,52 @@
+{
+  "paths": {
+    "tests": "src/tests",
+    "pageObjects": "src/page-objects",
+    "uploadFiles": "src/upload-files"
+  },
+  "browser": {
+    "inheritViewportFromPlaywrightConfig": false,
+    "viewport": { "width": 1500, "height": 1100 }
+  },
+  "debugUi": {
+    "sidePanelWidth": 800
+  },
+  "timeouts": {
+    "page": {
+      "networkIdleMs": 15000,
+      "loadFallbackMs": 15000
+    },
+    "discovery": {
+      "locatorStrategyMs": 2000,
+      "betweenStepsMs": 500
+    },
+    "player": {
+      "postNavigateMs": 500,
+      "betweenStepsMs": 200,
+      "tableReResolveLocatorMs": 500
+    },
+    "debugRunner": {
+      "betweenStepsMs": 200,
+      "postNavigateMs": 300,
+      "recorderPollMs": 500,
+      "postClickUrlChangeDetectMs": 1000
+    },
+    "action": {
+      "uploadVisibleMs": 10000,
+      "assertVisibleMs": 5000,
+      "waitEnabledVisibleMs": 10000,
+      "waitEnabledTotalMs": 10000,
+      "waitEnabledPollMs": 200
+    },
+    "locator": {
+      "defaultStrategyMs": 500,
+      "dialogMinimumMs": 2000,
+      "frameStrategyMinimumMs": 2000,
+      "frameDomContentLoadedMs": 5000,
+      "childFrameReadyMs": 12000,
+      "childFramePollMs": 300,
+      "frameUrlMatchMs": 15000,
+      "frameUrlPollMs": 200
+    }
+  }
+}
