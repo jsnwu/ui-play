@@ -66,7 +66,12 @@ export async function runDiscovery(options: DiscoveryOptions): Promise<{
   const timeouts = getUiplayConfig().timeouts;
   const locatorTimeoutMs = options.locatorTimeoutMs ?? timeouts.discovery.locatorStrategyMs;
 
-  const browser = await chromium.launch({ headless: options.headless ?? false });
+  const cfg = getUiplayConfig();
+  const browser = await chromium.launch({
+    headless: options.headless ?? false,
+    ...(cfg.browser.channel ? { channel: cfg.browser.channel as any } : {}),
+    ...(Array.isArray(cfg.browser.args) && cfg.browser.args.length ? { args: cfg.browser.args } : {}),
+  });
   const contextOptions = await getPlaywrightBrowserContextOptions();
   const context = await browser.newContext(contextOptions);
   const page = await context.newPage();

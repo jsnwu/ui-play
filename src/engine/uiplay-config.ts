@@ -11,16 +11,31 @@ export interface UiplayPathsConfig {
   tests: string;
   pageObjects: string;
   uploadFiles: string;
+  /**
+   * Dotenv files to load (relative to repo root unless absolute).
+   * Default preserves legacy behavior: [".env", "browser/.env"].
+   */
+  envFiles?: string[];
 }
 
 export interface UiplayBrowserConfig {
   inheritViewportFromPlaywrightConfig: boolean;
   viewport: { width: number; height: number };
+  /**
+   * Optional Playwright browser channel to use instead of the bundled Chromium.
+   * Examples: "chrome", "msedge". When unset, uses Playwright's bundled Chromium.
+   */
+  channel?: string;
+  /** Extra Chromium launch args (advanced / perf troubleshooting). */
+  args?: string[];
 }
 
 export interface UiplayDebugUiConfig {
   sidePanelWidth: number;
-  /** When true, the app page shows a hover outline on interactive elements (buttons, links, inputs). Default true. */
+  /**
+   * When true, debug runner shows hover + green playback outlines on the app page only during
+   * Run step / Run all / Resume. While idle, highlight code is off. Default false.
+   */
   highlightInteractiveElements: boolean;
 }
 
@@ -76,14 +91,17 @@ const DEFAULT_CONFIG: UiplayConfig = {
     tests: "tests",
     pageObjects: "src/page-objects",
     uploadFiles: "src/upload-files",
+    envFiles: [".env", "browser/.env"],
   },
   browser: {
     inheritViewportFromPlaywrightConfig: false,
     viewport: { width: 1500, height: 1100 },
+    channel: undefined,
+    args: undefined,
   },
   debugUi: {
     sidePanelWidth: 800,
-    highlightInteractiveElements: true,
+    highlightInteractiveElements: false,
   },
   timeouts: {
     page: {

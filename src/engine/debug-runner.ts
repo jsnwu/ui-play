@@ -1,4 +1,4 @@
-import { chromium, Locator, Page } from "playwright";
+import { chromium, Frame, Locator, Page } from "playwright";
 import path from "path";
 import fs from "fs";
 const { marked } = require("marked") as { marked: (src: string) => string };
@@ -57,12 +57,43 @@ interface DebugSessionState {
   logPanelVisible?: boolean;
   /** When set, Run button shows as Resume and continues from this step index (after stop/breakpoint/failure). */
   resumableFromIndex?: number;
-  /** Outline interactive elements on the app page on hover. Default true (see config.json debugUi). */
+  /**
+   * When true, hover + green playback outlines apply while Run step / Run all / Resume is executing.
+   * The app page highlight script stays off while idle (see debugUi.highlightInteractiveElements).
+   */
   highlightInteractiveElements?: boolean;
+  /** True only during run-step / run-all / run-from so executeStep can gate playback outlines. */
+  automatedRunActive?: boolean;
 }
 
-async function syncHighlightToAllFrames(appPage: Page, state: DebugSessionState): Promise<void> {
-  const enabled = state.highlightInteractiveElements !== false;
+/** Inject recorder script into one frame (string evaluate; avoid page eval() for CSP). */
+async function injectRecorderIntoFrame(frame: Frame): Promise<void> {
+  const code = getDebugRecorderScript();
+  try {
+    await frame.evaluate(code);
+  } catch {
+    // cross-origin, detached, or document not ready
+  }
+}
+
+/** Remove recorder capture listeners so input/click handlers stop burning CPU after Stop recording / Reset. */
+async function teardownRecorderInAllFrames(page: Page): Promise<void> {
+  for (const frame of page.frames()) {
+    try {
+      await frame.evaluate(() => {
+        const w = window as unknown as { __uiplayRecorderTeardown?: () => void };
+        if (typeof w.__uiplayRecorderTeardown === "function") {
+          w.__uiplayRecorderTeardown();
+        }
+      });
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/** Push hover-outline on/off to every frame (detaches listeners when false). */
+async function applyHoverHighlightEffectiveToAllFrames(appPage: Page, effective: boolean): Promise<void> {
   for (const frame of appPage.frames()) {
     try {
       await frame.evaluate(
@@ -76,7 +107,7 @@ async function syncHighlightToAllFrames(appPage: Page, state: DebugSessionState)
             w.__uiplaySetHighlightEnabled(e);
           }
         },
-        enabled
+        effective
       );
     } catch {
       // cross-origin frame or document not ready
@@ -138,18 +169,39 @@ export async function runDebug(options: DebugRunOptions): Promise<void> {
     logs: [],
     logPanelVisible: false,
     highlightInteractiveElements: highlightCfg !== false,
+    automatedRunActive: false,
   };
 
   const contextOptions = await getPlaywrightBrowserContextOptions();
   const debugPanelWidth = getUiplayConfig().debugUi.sidePanelWidth;
 
   // Use two separate contexts in a single browser so the app and debug UI appear as separate windows.
-  const browser = await chromium.launch({ headless: options.headless ?? false });
-  const appContext = await browser.newContext(contextOptions);
+  const cfg = getUiplayConfig();
   const uiViewport =
     contextOptions.viewport && typeof contextOptions.viewport.height === "number"
       ? { width: debugPanelWidth, height: contextOptions.viewport.height }
       : { width: debugPanelWidth, height: 600 };
+
+  const launchBase = {
+    headless: options.headless ?? false,
+    ...(cfg.browser.channel ? { channel: cfg.browser.channel as any } : {}),
+  };
+  const launchArgsRaw = Array.isArray(cfg.browser.args) ? cfg.browser.args : [];
+  const launchArgsSanitized = launchArgsRaw.filter((a) => {
+    const s = String(a || "").trim();
+    if (!s) return false;
+    // Playwright rejects args that attempt to open a page (applies to launch and persistent context),
+    // e.g. `--app=...` or passing a URL directly.
+    if (s.startsWith("--app=")) return false;
+    if (/^(https?:|file:|about:|data:)/i.test(s)) return false;
+    return true;
+  });
+  const launchArgs = launchArgsSanitized;
+  const launchBaseWithArgs =
+    launchArgs.length > 0 ? { ...launchBase, args: launchArgs } : launchBase;
+
+  const browser = await chromium.launch(launchBaseWithArgs);
+  const appContext = await browser.newContext(contextOptions);
   const uiContext = await browser.newContext({
     ...contextOptions,
     viewport: uiViewport,
@@ -158,19 +210,81 @@ export async function runDebug(options: DebugRunOptions): Promise<void> {
   const appPage = await appContext.newPage();
   const uiPage = await uiContext.newPage();
 
-  const hlScript = getInteractiveHighlightInitScript();
-  await appPage.addInitScript({ content: hlScript });
-  try {
-    await appPage.evaluate((code: string) => {
-      (0, eval)(code);
-    }, hlScript);
-  } catch {
-    // ignore if main frame cannot eval yet
+  const dropped = launchArgsRaw.filter((a) => !launchArgsSanitized.includes(a));
+  if (dropped.length > 0) {
+    // eslint-disable-next-line no-console
+    console.warn("[debug-runner] dropped launch args not supported by Playwright:", dropped);
   }
-  await syncHighlightToAllFrames(appPage, state);
-  appPage.on("framenavigated", () => {
-    void syncHighlightToAllFrames(appPage, state);
-  });
+
+  // Highlight script is injected lazily only when needed (during automated runs when Highlight is enabled),
+  // so an idle debug session behaves like a normal browser tab as closely as possible.
+  let highlightScriptInjected = false;
+  const ensureHighlightScriptInjected = async () => {
+    if (highlightScriptInjected) return;
+    const hlScript = getInteractiveHighlightInitScript();
+    await appPage.addInitScript({ content: hlScript });
+    try {
+      await appPage.evaluate((code: string) => {
+        (0, eval)(code);
+      }, hlScript);
+    } catch {
+      // ignore if main frame cannot eval yet
+    }
+    highlightScriptInjected = true;
+  };
+
+  let recorderNavListenerAttached = false;
+  const onRecorderFrameNavigated = (frame: Frame) => {
+    if (!state.recording) return;
+    void injectRecorderIntoFrame(frame);
+  };
+  const detachDebugRecorder = async () => {
+    if (recorderNavListenerAttached) {
+      appPage.off("framenavigated", onRecorderFrameNavigated);
+      recorderNavListenerAttached = false;
+    }
+    await teardownRecorderInAllFrames(appPage);
+  };
+
+  // framenavigated fires for the main document and every iframe load. Busy sites can emit
+  // many events per second; syncing all frames each time spams CDP/JS and drives CPU/GPU.
+  let highlightSyncDebounce: ReturnType<typeof setTimeout> | null = null;
+  const HIGHLIGHT_SYNC_DEBOUNCE_MS = 200;
+  const cancelPendingHighlightNavSync = () => {
+    if (highlightSyncDebounce) {
+      clearTimeout(highlightSyncDebounce);
+      highlightSyncDebounce = null;
+    }
+  };
+  const scheduleHighlightSyncAfterNavigation = () => {
+    // Idle: highlight init script defaults to off per frame; avoid evaluating every frame on
+    // each navigation (SPAs/iframes can fire framenavigated very often and drove CPU/GPU).
+    if (!state.automatedRunActive) return;
+    if (highlightSyncDebounce) clearTimeout(highlightSyncDebounce);
+    highlightSyncDebounce = setTimeout(() => {
+      highlightSyncDebounce = null;
+      // Run may have finished in the debounce window; do not re-enable hover highlight idle.
+      if (!state.automatedRunActive) {
+        void applyHoverHighlightEffectiveToAllFrames(appPage, false);
+        return;
+      }
+      void applyHoverHighlightEffectiveToAllFrames(
+        appPage,
+        state.highlightInteractiveElements !== false
+      );
+    }, HIGHLIGHT_SYNC_DEBOUNCE_MS);
+  };
+  let highlightNavListenerAttached = false;
+  const attachHighlightNavListener = () => {
+    if (highlightNavListenerAttached) return;
+    appPage.on("framenavigated", scheduleHighlightSyncAfterNavigation);
+    highlightNavListenerAttached = true;
+  };
+  const detachHighlightNavListener = () => {
+    if (!highlightNavListenerAttached) return;
+    appPage.off("framenavigated", scheduleHighlightSyncAfterNavigation);
+    highlightNavListenerAttached = false;
+  };
 
   // When the debug UI window/tab is closed, close the browser and terminate the process.
   uiPage.on("close", () => {
@@ -255,7 +369,15 @@ export async function runDebug(options: DebugRunOptions): Promise<void> {
         const p = payload as { enabled?: boolean };
         if (typeof p.enabled === "boolean") {
           state.highlightInteractiveElements = p.enabled;
-          await syncHighlightToAllFrames(appPage, state);
+          // While idle, turning Highlight off must push to the app page (debounced nav sync can
+          // have re-enabled hover listeners without updating this flag first).
+          if (!state.automatedRunActive && p.enabled === false) {
+            try {
+              await applyHoverHighlightEffectiveToAllFrames(appPage, false);
+            } catch {
+              // ignore
+            }
+          }
         }
         return { ok: true };
       }
@@ -325,6 +447,15 @@ export async function runDebug(options: DebugRunOptions): Promise<void> {
             const stopAbortForStep = new Promise<never>((_, reject) => {
               stopAbortReject = (e?: Error) => reject(e ?? new Error("Stopped"));
             });
+            state.automatedRunActive = true;
+            if (state.highlightInteractiveElements !== false) {
+              await ensureHighlightScriptInjected();
+              attachHighlightNavListener();
+              await applyHoverHighlightEffectiveToAllFrames(appPage, true);
+            } else {
+              // Keep listener detached when Highlight is off to avoid any CDP/evaluate overhead on iframe-heavy sites.
+              detachHighlightNavListener();
+            }
             try {
               await runSingleStep(
                 appPage,
@@ -337,6 +468,14 @@ export async function runDebug(options: DebugRunOptions): Promise<void> {
               );
             } finally {
               stopAbortReject = null;
+              cancelPendingHighlightNavSync();
+              state.automatedRunActive = false;
+              try {
+                await applyHoverHighlightEffectiveToAllFrames(appPage, false);
+              } catch {
+                // ignore (e.g. page closed)
+              }
+              detachHighlightNavListener();
             }
             break;
           }
@@ -345,6 +484,14 @@ export async function runDebug(options: DebugRunOptions): Promise<void> {
             const stopAbortPromise = new Promise<never>((_, reject) => {
               stopAbortReject = (e?: Error) => reject(e ?? new Error("Stopped"));
             });
+            state.automatedRunActive = true;
+            if (state.highlightInteractiveElements !== false) {
+              await ensureHighlightScriptInjected();
+              attachHighlightNavListener();
+              await applyHoverHighlightEffectiveToAllFrames(appPage, true);
+            } else {
+              detachHighlightNavListener();
+            }
             try {
               state.resumableFromIndex = undefined;
               state.saveMessageVisible = false;
@@ -399,6 +546,14 @@ export async function runDebug(options: DebugRunOptions): Promise<void> {
               }
             } finally {
               stopAbortReject = null;
+              cancelPendingHighlightNavSync();
+              state.automatedRunActive = false;
+              try {
+                await applyHoverHighlightEffectiveToAllFrames(appPage, false);
+              } catch {
+                // ignore (e.g. page closed)
+              }
+              detachHighlightNavListener();
             }
             break;
           }
@@ -407,6 +562,14 @@ export async function runDebug(options: DebugRunOptions): Promise<void> {
             const stopAbortPromise = new Promise<never>((_, reject) => {
               stopAbortReject = (e?: Error) => reject(e ?? new Error("Stopped"));
             });
+            state.automatedRunActive = true;
+            if (state.highlightInteractiveElements !== false) {
+              await ensureHighlightScriptInjected();
+              attachHighlightNavListener();
+              await applyHoverHighlightEffectiveToAllFrames(appPage, true);
+            } else {
+              detachHighlightNavListener();
+            }
             try {
               state.saveMessageVisible = false;
               const uiSteps = command.steps ?? [];
@@ -452,6 +615,14 @@ export async function runDebug(options: DebugRunOptions): Promise<void> {
               }
             } finally {
               stopAbortReject = null;
+              cancelPendingHighlightNavSync();
+              state.automatedRunActive = false;
+              try {
+                await applyHoverHighlightEffectiveToAllFrames(appPage, false);
+              } catch {
+                // ignore (e.g. page closed)
+              }
+              detachHighlightNavListener();
             }
             break;
           }
@@ -498,14 +669,21 @@ export async function runDebug(options: DebugRunOptions): Promise<void> {
             if (!state.recording) {
               state.recording = true;
               state.recordedCount = 0;
-              const script = getDebugRecorderScript();
-              await appPage.addInitScript(script);
+              // Do not use addInitScript: it cannot be removed and would re-attach capture-phase
+              // input/click listeners on every navigation (heavy on React-controlled inputs).
+              if (!recorderNavListenerAttached) {
+                appPage.on("framenavigated", onRecorderFrameNavigated);
+                recorderNavListenerAttached = true;
+              }
               // Inject into main frame and every existing iframe so actions inside iframes are captured.
               for (const frame of appPage.frames()) {
                 try {
-                  await frame.evaluate(script);
+                  await injectRecorderIntoFrame(frame);
                   await frame.evaluate(
                     "if (Array.isArray(window.__recordedActions)) window.__recordedActions.length = 0;"
+                  );
+                  await frame.evaluate(
+                    "try { if (window.sessionStorage) window.sessionStorage.removeItem('__uiplay_recordedActions_v1'); } catch (e) {}"
                   );
                 } catch {
                   // ignore frames that don't accept script (e.g. cross-origin)
@@ -539,10 +717,31 @@ export async function runDebug(options: DebugRunOptions): Promise<void> {
             }
             // Reset session counters; array itself will be cleared on the next start-record.
             state.recordedCount = 0;
+            try {
+              await appPage.evaluate(
+                "try { if (window.sessionStorage) window.sessionStorage.removeItem('__uiplay_recordedActions_v1'); } catch (e) {}"
+              );
+            } catch {
+              // ignore
+            }
+            await detachDebugRecorder();
             break;
           }
           case "open-test": {
             state.saveMessageVisible = false;
+            if (state.recording) {
+              state.recording = false;
+              if (state.streamRecorderDone) {
+                try {
+                  await state.streamRecorderDone;
+                } catch {
+                  // ignore
+                }
+                state.streamRecorderDone = undefined;
+              }
+              state.recordedCount = 0;
+            }
+            await detachDebugRecorder();
             const freshTest = command.yamlContent
               ? loadTestCaseFromContent(command.yamlContent)
               : loadTestCase((command.testId ?? "").trim());
@@ -573,6 +772,8 @@ export async function runDebug(options: DebugRunOptions): Promise<void> {
             }));
             state.lastExecutedIndex = null;
             state.resumableFromIndex = undefined;
+            cancelPendingHighlightNavSync();
+            detachHighlightNavListener();
             await appPage.context().clearCookies();
             await appPage.goto("about:blank");
             break;
@@ -592,6 +793,8 @@ export async function runDebug(options: DebugRunOptions): Promise<void> {
             state.saveMessageVisible = false;
             state.resumableFromIndex = undefined;
             state.logs = [];
+            cancelPendingHighlightNavSync();
+            detachHighlightNavListener();
             // If recording, stop it and reset counters so no further actions are streamed.
             if (state.recording) {
               state.recording = false;
@@ -608,10 +811,14 @@ export async function runDebug(options: DebugRunOptions): Promise<void> {
                 await appPage.evaluate(
                   "if (Array.isArray(window.__recordedActions)) window.__recordedActions.length = 0;"
                 );
+                await appPage.evaluate(
+                  "try { if (window.sessionStorage) window.sessionStorage.removeItem('__uiplay_recordedActions_v1'); } catch (e) {}"
+                );
               } catch {
                 // ignore if recorder script is not present
               }
             }
+            await detachDebugRecorder();
             // Reset session state while preserving the current in-memory test,
             // including any cached/resolved locators, enabled flags, and unsaved edits.
             // Only env, per-step status, breakpoints, and browser/session state are reset.
@@ -1200,7 +1407,7 @@ ${variablesSectionHtml}
           id="highlight-interactive-btn"
           class="toolbar-highlight-btn"
           aria-pressed="${state.highlightInteractiveElements !== false ? "true" : "false"}"
-          title="Toggle outline on interactive elements (hover + playback). Click to turn on or off."
+          title="When on, show hover + green step outlines on the app page only while Run step, Run all, or Resume is executing. Stays off while idle."
           data-role="toggle-highlight"
           onclick="toggleHighlightInteractive()"
         >
@@ -2294,7 +2501,7 @@ async function highlightPlaybackTargetIfEnabled(
   state: DebugSessionState,
   raceStop: <T>(p: Promise<T>) => Promise<T>
 ): Promise<void> {
-  if (state.highlightInteractiveElements === false) return;
+  if (state.automatedRunActive !== true || state.highlightInteractiveElements === false) return;
   try {
     await showGreenPlaybackHighlight(loc, raceStop);
   } catch {

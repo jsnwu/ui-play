@@ -1,14 +1,21 @@
 /**
  * Injected into the app page (all frames) during debug sessions.
  * Shows a hover outline on interactive elements (buttons, links, inputs, etc.).
+ *
+ * Scroll/resize updates are rAF-coalesced (raw scroll can fire very fast and was
+ * driving CPU/GPU). Starts disabled per frame; listeners attach only when enabled.
+ * No CSS transitions
+ * on the overlay (avoids extra compositing during frequent reposition).
  */
 
 export function getInteractiveHighlightInitScript(): string {
   return `
 (function() {
-  var VERSION = 1;
+  var VERSION = 3;
   if (window.__uiplayHighlightV === VERSION) return;
-  window.__uiplayHighlightV = VERSION;
+  if (typeof window.__uiplayHighlightTeardown === 'function') {
+    try { window.__uiplayHighlightTeardown(); } catch (e) {}
+  }
 
   var INTERACTIVE_SEL =
     'button,select,textarea,input,a[href],area[href],' +
@@ -24,14 +31,16 @@ export function getInteractiveHighlightInitScript(): string {
     return hit;
   }
 
-  var enabled = true;
+  // Default off: each frame has its own window; __UPLAY_HL_ENABLED_GLOBAL is not inherited
+  // from the parent, so "undefined" must mean idle — never attach pointermove/rAF until Node enables.
+  var enabled = false;
   var lastTarget = null;
   var box = document.createElement('div');
   box.setAttribute('data-uiplay-highlight', '1');
   box.style.cssText =
     'position:fixed;pointer-events:none;z-index:2147483646;box-sizing:border-box;' +
     'border:2px solid rgba(34,197,94,0.95);border-radius:3px;background:rgba(34,197,94,0.08);' +
-    'display:none;transition:left 40ms ease-out,top 40ms ease-out,width 40ms ease-out,height 40ms ease-out';
+    'display:none';
   (document.documentElement || document.body).appendChild(box);
 
   function positionBox(el) {
@@ -56,17 +65,17 @@ export function getInteractiveHighlightInitScript(): string {
     box.style.display = 'none';
   }
 
-  var rafPending = false;
-  var lastEvent = null;
+  var moveRafPending = false;
+  var lastPointerEvent = null;
   function onPointerMove(e) {
-    lastEvent = e;
     if (!enabled) return;
-    if (rafPending) return;
-    rafPending = true;
+    lastPointerEvent = e;
+    if (moveRafPending) return;
+    moveRafPending = true;
     requestAnimationFrame(function() {
-      rafPending = false;
+      moveRafPending = false;
       if (!enabled) return;
-      var ev = lastEvent;
+      var ev = lastPointerEvent;
       if (!ev) return;
       var el = document.elementFromPoint(ev.clientX, ev.clientY);
       var t = retargetInteractive(el);
@@ -79,29 +88,68 @@ export function getInteractiveHighlightInitScript(): string {
     });
   }
 
+  var scrollRafId = 0;
   function onScrollOrResize() {
     if (!enabled || !lastTarget) return;
-    positionBox(lastTarget);
+    if (scrollRafId) return;
+    scrollRafId = requestAnimationFrame(function() {
+      scrollRafId = 0;
+      if (!enabled || !lastTarget) return;
+      positionBox(lastTarget);
+    });
   }
 
-  document.addEventListener('pointermove', onPointerMove, true);
-  window.addEventListener('scroll', onScrollOrResize, true);
-  window.addEventListener('resize', onScrollOrResize, true);
+  var listenersAttached = false;
+  var scrollOpts = { capture: true, passive: true };
+  function attachListeners() {
+    if (listenersAttached) return;
+    listenersAttached = true;
+    document.addEventListener('pointermove', onPointerMove, true);
+    window.addEventListener('scroll', onScrollOrResize, scrollOpts);
+    window.addEventListener('resize', onScrollOrResize, scrollOpts);
+  }
+  function detachListeners() {
+    if (!listenersAttached) return;
+    listenersAttached = false;
+    document.removeEventListener('pointermove', onPointerMove, true);
+    window.removeEventListener('scroll', onScrollOrResize, scrollOpts);
+    window.removeEventListener('resize', onScrollOrResize, scrollOpts);
+  }
 
   function applyEnabled(e) {
-    enabled = e;
-    if (!e) hideBox();
+    var next = !!e;
+    enabled = next;
+    if (!next) {
+      if (scrollRafId) {
+        cancelAnimationFrame(scrollRafId);
+        scrollRafId = 0;
+      }
+      moveRafPending = false;
+      hideBox();
+      detachListeners();
+    } else {
+      attachListeners();
+    }
   }
 
   window.__uiplaySetHighlightEnabled = function(e) {
     applyEnabled(!!e);
   };
 
-  function syncFromNode() {
-    if (window.__UPLAY_HL_ENABLED_GLOBAL !== undefined) {
-      applyEnabled(!!window.__UPLAY_HL_ENABLED_GLOBAL);
-    }
+  window.__uiplayHighlightV = VERSION;
+
+  if (window.__UPLAY_HL_ENABLED_GLOBAL !== undefined) {
+    applyEnabled(!!window.__UPLAY_HL_ENABLED_GLOBAL);
+  } else {
+    applyEnabled(false);
   }
-  syncFromNode();
+
+  window.__uiplayHighlightTeardown = function() {
+    applyEnabled(false);
+    if (box && box.parentNode) box.parentNode.removeChild(box);
+    delete window.__uiplayHighlightTeardown;
+    delete window.__uiplaySetHighlightEnabled;
+    delete window.__uiplayHighlightV;
+  };
 })();`;
 }

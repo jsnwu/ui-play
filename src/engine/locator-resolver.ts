@@ -77,6 +77,7 @@ function normalizeElementForMatch(element: string): string[] {
 }
 
 const ROLE_PREFIX = "role|";
+const ALT_PREFIX = "alt|";
 const PLACEHOLDER_PREFIX = "placeholder|";
 const LABEL_PREFIX = "label|";
 const TEXT_PREFIX = "text|";
@@ -177,10 +178,19 @@ async function runAttemptBatch(
 }
 
 /**
- * Try to resolve a step against a single target (page or frame). Returns null if not found.
- * Runs locator strategies in batches of LOCATOR_BATCH_SIZE concurrently; stops when one succeeds.
+ * Tiered attempt resolver for discovery.
+ *
+ * Goal:
+ * - Try role-based matches in higher tiers first (tier1, then tier2).
+ * - Try non-role attribute matching + heuristics next (tier3).
+ * - Finally, try non-preferred role fallbacks (tier4).
+ *
+ * Notes:
+ * - This is intentionally kept behavior-preserving for existing match expressions,
+ *   but it removes the prior O(n^2) duplication that happened with the nested
+ *   button+hasText loop.
  */
-async function tryResolveInTarget(
+async function tryResolveInTargetTiers(
   target: LocatorTarget,
   step: StepIntent,
   namesToTry: string[],
@@ -192,6 +202,7 @@ async function tryResolveInTarget(
   abortPromise?: Promise<never>
 ): Promise<ResolvedLocatorForStep | null> {
   const { action, element } = step;
+
   const log = (msg: string, ...args: unknown[]) => {
     if (!debug && !onLog) return;
     const full =
@@ -201,16 +212,17 @@ async function tryResolveInTarget(
     if (onLog) onLog(full);
     if (debug) console.log(msg, ...args);
   };
+
   const toSingle = <T extends { first: () => T; nth: (n: number) => T }>(loc: T) =>
     elementIndex !== undefined && elementIndex > 0 ? loc.nth(elementIndex) : loc.first();
 
   const escapeForAttrSelector = (value: string): string =>
     value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/]/g, "\\]");
 
-  // When a role was prioritized by keyword (button, link, radio, input, option, etc.), try that role's strategies first.
   const preferredRole = roles[0];
   const clickOrHover = action === "click" || action === "hover" || action === "dblclick";
   const fillOrSelect = action === "fill" || action === "select";
+
   const preferredForClickHover = [
     "button",
     "link",
@@ -222,30 +234,102 @@ async function tryResolveInTarget(
     "gridcell",
     "cell",
   ].includes(preferredRole ?? "");
-  const preferredForFillSelect = ["textbox", "searchbox", "combobox"].includes(
-    preferredRole ?? ""
-  );
+  const preferredForFillSelect = ["textbox", "searchbox", "combobox"].includes(preferredRole ?? "");
+
   const tryPreferredRoleFirst =
     preferredRole &&
     ((clickOrHover && preferredForClickHover) || (fillOrSelect && preferredForFillSelect));
 
+  const elementText = element;
+  const shouldTryTextInput =
+    (action === "click" || action === "dblclick") &&
+    typeof elementText === "string" &&
+    /\b(input|field|dropdown)\b/i.test(elementText);
+
+  const shouldTryNonRolePlaceholderLabel = action !== "fill" && action !== "select";
   type Attempt = () => Promise<ResolvedLocatorForStep | null>;
   const attempts: Attempt[] = [];
 
   for (const name of namesToTry) {
+    const isFileInput = (action === "upload" && (name === "file input" || name === "file"));
     const nameRegex = new RegExp(
       name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+"),
       "i"
     );
     const ciRegex = new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    const escapedName = escapeForAttrSelector(name);
 
-    // For upload: "file input" / "file" targets the visible <input type="file"> (e.g. after clicking "New File(s)").
-    if (action === "upload" && (name === "file input" || name === "file")) {
+    // Used by text-exact and text-contains fallbacks (keep the same semantics as the old implementation).
+    const clickTextExactRegex = nameRegex;
+    const clickTextContainsRegex = new RegExp(
+      name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+      "i"
+    );
+
+    // Precompute icon slug once per candidate name.
+    const slug = name
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, "-")
+      .replace(/[^a-z0-9_-]/g, "");
+    const slugTooGeneric = slug === "icon" || slug === "-icon";
+
+    //** tier 1: preferred role + exact-ish name/alt; special-case **
+    if (tryPreferredRoleFirst) {
+      // role+name (preferred exact)
+      attempts.push(async () => {
+        try {
+          log(
+            "[discovery] [tier1] trying role+name (preferred exact)",
+            JSON.stringify({ role: preferredRole, pattern: ciRegex.source })
+          );
+          const base = target.getByRole(preferredRole as "button", { name: ciRegex });
+          const loc = toSingle(base);
+          await loc.waitFor({ state: "visible", timeout });
+          log("[discovery] [tier1] matched by role+name (preferred)");
+          return {
+            stored: serializeRoleLocator(preferredRole, name, elementIndex),
+            locator: loc,
+            clickLocator: loc,
+            fillLocator: loc,
+          };
+        } catch {
+          return null;
+        }
+      });
+
+      // role+alt (preferred exact)
+      attempts.push(async () => {
+        try {
+          log(
+            "[discovery] [tier1] trying role+alt (preferred exact)",
+            JSON.stringify({ role: preferredRole, name })
+          );
+          const altLoc = target.getByAltText(name);
+          const roleLoc = target
+            .getByRole(preferredRole as "button")
+            .filter({ has: altLoc });
+          const loc = toSingle(roleLoc);
+          await loc.waitFor({ state: "visible", timeout });
+          log("[discovery] [tier1] matched by role+alt (preferred exact)");
+          return {
+            stored: serializeRoleLocator(preferredRole, name, elementIndex),
+            locator: loc,
+            clickLocator: loc,
+            fillLocator: loc,
+          };
+        } catch {
+          return null;
+        }
+      });
+    }
+
+    if (isFileInput) {
       attempts.push(async () => {
         try {
           const loc = target.locator('input[type="file"]').first();
           await loc.waitFor({ state: "visible", timeout });
-          log("[discovery] matched by file input", JSON.stringify({ name }));
+          log("[discovery] [tier1] matched by file input", JSON.stringify({ name }));
           return {
             stored: FILE_INPUT_PREFIX,
             locator: loc,
@@ -258,37 +342,21 @@ async function tryResolveInTarget(
       });
     }
 
-    if (fillOrSelect) {
+    //** tier 2: preferred role regex/contains; role+title and role+alt (regex) **
+    if (tryPreferredRoleFirst) {
+      // role+regex (preferred)
       attempts.push(async () => {
         try {
-          const labelLike = target.getByText(name, { exact: false });
-          const container = labelLike.locator(
-            "xpath=parent::*[.//input or .//textarea or .//*[@contenteditable='true']][1]"
+          log(
+            "[discovery] [tier2] trying role+regex (preferred)",
+            JSON.stringify({ role: preferredRole, name, pattern: nameRegex.source })
           );
-          const inputLike = container
-            .locator("input, textarea, [contenteditable='true']")
-            .filter({ visible: true });
-          const input = inputLike.first();
-          await input.waitFor({ state: "visible", timeout });
-          log("[discovery] matched by text+descendant-input (fill first)", JSON.stringify({ name }));
-          return {
-            stored: `${TEXT_INPUT_PREFIX}${name}`,
-            locator: input,
-            clickLocator: container.first(),
-            fillLocator: input,
-          };
-        } catch {
-          return null;
-        }
-      });
-      attempts.push(async () => {
-        try {
-          const phRegex = new RegExp(name.replace(/\s+/g, "\\s+"), "i");
-          const loc = target.getByPlaceholder(phRegex);
+          const base = target.getByRole(preferredRole as "button", { name: nameRegex });
+          const loc = toSingle(base);
           await loc.waitFor({ state: "visible", timeout });
-          log("[discovery] matched by placeholder (fill first)", JSON.stringify({ name }));
+          log("[discovery] [tier2] matched by role+regex (preferred)");
           return {
-            stored: `${PLACEHOLDER_PREFIX}${name}`,
+            stored: serializeRoleLocator(preferredRole, name, elementIndex),
             locator: loc,
             clickLocator: loc,
             fillLocator: loc,
@@ -297,14 +365,73 @@ async function tryResolveInTarget(
           return null;
         }
       });
+
+      // role+hasText (preferred)
       attempts.push(async () => {
         try {
-          const labelRegex = new RegExp(name.replace(/\s+/g, "\\s+"), "i");
-          const loc = target.getByLabel(labelRegex);
+          log(
+            "[discovery] [tier2] trying role+hasText (preferred)",
+            JSON.stringify({ role: preferredRole, pattern: ciRegex.source })
+          );
+          const roleLoc = target
+            .getByRole(preferredRole as "button")
+            .filter({ hasText: ciRegex });
+          const loc = toSingle(roleLoc);
           await loc.waitFor({ state: "visible", timeout });
-          log("[discovery] matched by label (fill first)", JSON.stringify({ name }));
+          log("[discovery] [tier2] matched by role+hasText (preferred)");
           return {
-            stored: `${LABEL_PREFIX}${name}`,
+            stored: serializeRoleLocator(preferredRole, name, elementIndex),
+            locator: loc,
+            clickLocator: loc,
+            fillLocator: loc,
+          };
+        } catch {
+          return null;
+        }
+      });
+
+      // role+alt (preferred regex)
+      attempts.push(async () => {
+        try {
+          log(
+            "[discovery] [tier2] trying role+alt (preferred regex)",
+            JSON.stringify({ role: preferredRole, pattern: nameRegex.source })
+          );
+          const altLoc = target.getByAltText(nameRegex);
+          const roleLoc = target
+            .getByRole(preferredRole as "button")
+            .filter({ has: altLoc });
+          const loc = toSingle(roleLoc);
+          await loc.waitFor({ state: "visible", timeout });
+          log("[discovery] [tier2] matched by role+alt (preferred regex)");
+          return {
+            stored: serializeRoleLocator(preferredRole, name, elementIndex),
+            locator: loc,
+            clickLocator: loc,
+            fillLocator: loc,
+          };
+        } catch {
+          return null;
+        }
+      });
+
+      // role+title attribute contains (CSS)
+      attempts.push(async () => {
+        try {
+          const selector = `[role="${preferredRole}"][title*="${escapedName}"]`;
+          log(
+            "[discovery] [tier2] trying role+title attribute",
+            JSON.stringify({ role: preferredRole, name, selector })
+          );
+          const base = target.locator(selector);
+          const loc = toSingle(base);
+          await loc.waitFor({ state: "visible", timeout });
+          log(
+            "[discovery] [tier2] matched by role+title attribute",
+            JSON.stringify({ role: preferredRole, name, selector })
+          );
+          return {
+            stored: serializeRoleLocator(preferredRole, name, elementIndex),
             locator: loc,
             clickLocator: loc,
             fillLocator: loc,
@@ -315,57 +442,192 @@ async function tryResolveInTarget(
       });
     }
 
-    // For click/hover on something like "User menu button" where the control's
-    // main stable identifier is its title (e.g. <button title="User menu">),
-    // try matching by [role="<role>"][title*="<name>"] as a fallback.
-    if (clickOrHover) {
-      for (const role of roles) {
-        const r = role;
-        const escaped = escapeForAttrSelector(name);
-        attempts.push(async () => {
-          try {
-            const selector = `[role="${r}"][title*="${escaped}"]`;
-            log(
-              "[discovery] trying role+title attribute",
-              JSON.stringify({ role: r, name, selector })
-            );
-            const base = target.locator(selector);
-            const loc = toSingle(base);
-            await loc.waitFor({ state: "visible", timeout });
-            log(
-              "[discovery] matched by role+title attribute",
-              JSON.stringify({ role: r, name, selector })
-            );
-            return {
-              stored: serializeRoleLocator(r, name, elementIndex),
-              locator: loc,
-              clickLocator: loc,
-              fillLocator: loc,
-            };
-          } catch {
-            return null;
-          }
-        });
+    //** tier 3: non-role matching + heuristics **
+    // text -> descendant input container
+    attempts.push(async () => {
+      try {
+        const labelLike = target.getByText(name, { exact: false });
+        const container = labelLike.locator(
+          "xpath=parent::*[.//input or .//textarea or .//*[@contenteditable='true']][1]"
+        );
+        const inputLike = container
+          .locator("input, textarea, [contenteditable='true']")
+          .filter({ visible: true });
+        const input = inputLike.first();
+        await input.waitFor({ state: "visible", timeout });
+        log(
+          "[discovery] [tier3] matched by text+descendant-input (fill first)",
+          JSON.stringify({ name })
+        );
+        return {
+          stored: `${TEXT_INPUT_PREFIX}${name}`,
+          locator: input,
+          clickLocator: container.first(),
+          fillLocator: input,
+        };
+      } catch {
+        return null;
       }
-      // Also try any element whose title contains the name, regardless of role.
-      const escapedName = escapeForAttrSelector(name);
+    });
+
+    // alt-only attempts (first-class)
+    attempts.push(async () => {
+      try {
+        log("[discovery] [tier3] trying alt exact", JSON.stringify({ name }));
+        const loc = target.getByAltText(name).first();
+        await loc.waitFor({ state: "visible", timeout });
+        log("[discovery] [tier3] matched by alt exact", JSON.stringify({ name }));
+        return {
+          stored: `${ALT_PREFIX}${name}`,
+          locator: loc,
+          clickLocator: loc,
+          fillLocator: loc,
+        };
+      } catch {
+        return null;
+      }
+    });
+    attempts.push(async () => {
+      try {
+        log(
+          "[discovery] [tier3] trying alt regex",
+          JSON.stringify({ pattern: nameRegex.source })
+        );
+        const loc = target.getByAltText(nameRegex).first();
+        await loc.waitFor({ state: "visible", timeout });
+        log("[discovery] [tier3] matched by alt regex", JSON.stringify({ name }));
+        return {
+          stored: `${ALT_PREFIX}${name}`,
+          locator: loc,
+          clickLocator: loc,
+          fillLocator: loc,
+        };
+      } catch {
+        return null;
+      }
+    });
+
+    // title-only attribute contains
+    attempts.push(async () => {
+      try {
+        const selector = `[title*="${escapedName}"]`;
+        log("[discovery] [tier3] trying title-only attribute", JSON.stringify({ name, selector }));
+        const base = target.locator(selector);
+        const loc = toSingle(base);
+        await loc.waitFor({ state: "visible", timeout });
+        log("[discovery] [tier3] matched by title-only attribute", JSON.stringify({ name, selector }));
+        return {
+          stored: selector,
+          locator: loc,
+          clickLocator: loc,
+          fillLocator: loc,
+        };
+      } catch {
+        return null;
+      }
+    });
+
+    // text exact/contains
+    attempts.push(async () => {
+      try {
+        const loc = target.getByText(clickTextExactRegex, { exact: true }).first();
+        await loc.waitFor({ state: "visible", timeout });
+        log("[discovery] [tier3] matched by text-exact", JSON.stringify({ name }));
+        return {
+          stored: `${TEXT_PREFIX}${name}`,
+          locator: loc,
+          clickLocator: loc,
+          fillLocator: loc,
+        };
+      } catch {
+        return null;
+      }
+    });
+    attempts.push(async () => {
+      try {
+        const loc = target.getByText(clickTextContainsRegex).first();
+        await loc.waitFor({ state: "visible", timeout });
+        log("[discovery] [tier3] matched by text", JSON.stringify({ name }));
+        return {
+          stored: `${TEXT_PREFIX}${name}`,
+          locator: loc,
+          clickLocator: loc,
+          fillLocator: loc,
+        };
+      } catch {
+        return null;
+      }
+    });
+
+    // placeholder exact/contains
+    attempts.push(async () => {
+      try {
+        const nameRegexForPlaceholder = new RegExp(name.replace(/\s+/g, "\\s+"), "i");
+        const loc = target.getByPlaceholder(nameRegexForPlaceholder).first();
+        await loc.waitFor({ state: "visible", timeout });
+        log("[discovery] [tier3] matched by placeholder", JSON.stringify({ name }));
+        return {
+          stored: `${PLACEHOLDER_PREFIX}${name}`,
+          locator: loc,
+          clickLocator: loc,
+          fillLocator: loc,
+        };
+      } catch {
+        return null;
+      }
+    });
+    attempts.push(async () => {
+      try {
+        const nameRegexForLabel = new RegExp(name.replace(/\s+/g, "\\s+"), "i");
+        const loc = target.getByLabel(nameRegexForLabel).first();
+        await loc.waitFor({ state: "visible", timeout });
+        log("[discovery] [tier3] matched by label", JSON.stringify({ name }));
+        return {
+          stored: `${LABEL_PREFIX}${name}`,
+          locator: loc,
+          clickLocator: loc,
+          fillLocator: loc,
+        };
+      } catch {
+        return null;
+      }
+    });
+
+    // label exact/contains
+    attempts.push(async () => {
+      try {
+        const labelRegex = new RegExp(name.replace(/\s+/g, "\\s+"), "i");
+        const loc = target.getByLabel(labelRegex);
+        await loc.waitFor({ state: "visible", timeout });
+        log("[discovery] [tier3] matched by label ", JSON.stringify({ name }));
+        return {
+          stored: `${LABEL_PREFIX}${name}`,
+          locator: loc,
+          clickLocator: loc,
+          fillLocator: loc,
+        };
+      } catch {
+        return null;
+      }
+    });
+
+    // data-testid exact/contains
+    if (slug && !slugTooGeneric) {
+      const escapedSlug = escapeForAttrSelector(slug);
       attempts.push(async () => {
         try {
-          const selector = `[title*="${escapedName}"]`;
+          const selector = `[data-testid="${escapedSlug}"]`;
           log(
-            "[discovery] trying title-only attribute",
-            JSON.stringify({ name, selector })
+            "[discovery] [tier3] trying data-testid exact",
+            JSON.stringify({ name, slug, selector })
           );
           const base = target.locator(selector);
           const loc = toSingle(base);
           await loc.waitFor({ state: "visible", timeout });
           log(
-            "[discovery] matched by title-only attribute",
-            JSON.stringify({ name, selector })
+            "[discovery] [tier3] matched by data-testid exact",
+            JSON.stringify({ name, slug, selector })
           );
-          // Store the actual selector so established runs use the same
-          // strategy (CSS [title*=...]) instead of pretending this was
-          // a role+name locator.
           return {
             stored: selector,
             locator: loc,
@@ -376,99 +638,57 @@ async function tryResolveInTarget(
           return null;
         }
       });
+      attempts.push(async () => {
+        try {
+          const selector = `[data-testid*="${escapedSlug}"]`;
+          log(
+            "[discovery] [tier3] trying data-testid contains",
+            JSON.stringify({ name, slug, selector })
+          );
+          const base = target.locator(selector);
+          const loc = toSingle(base);
+          await loc.waitFor({ state: "visible", timeout });
+          log(
+            "[discovery] [tier3] matched by data-testid contains",
+            JSON.stringify({ name, slug, selector })
+          );
+          return {
+            stored: selector,
+            locator: loc,
+            clickLocator: loc,
+            fillLocator: loc,
+          };
+        } catch {
+          return null;
+        }
+      });
+    }
 
-      // Try data-testid-based selectors commonly used in React apps, using
-      // both exact and wildcard matches derived from the logical name.
-      const slug = name
-        .trim()
-        .toLowerCase()
-        .replace(/\s+/g, "-")
-        .replace(/[^a-z0-9_-]/g, "");
-      const slugTooGeneric = slug === "icon" || slug === "-icon";
-      if (slug && !slugTooGeneric) {
-        const escapedSlug = escapeForAttrSelector(slug);
-        // Exact data-testid match, e.g. data-testid="new-tag-button"
-        attempts.push(async () => {
-          try {
-            const selector = `[data-testid="${escapedSlug}"]`;
-            log(
-              "[discovery] trying data-testid exact",
-              JSON.stringify({ name, slug, selector })
-            );
-            const base = target.locator(selector);
-            const loc = toSingle(base);
-            await loc.waitFor({ state: "visible", timeout });
-            log(
-              "[discovery] matched by data-testid exact",
-              JSON.stringify({ name, slug, selector })
-            );
-            return {
-              stored: selector,
-              locator: loc,
-              clickLocator: loc,
-              fillLocator: loc,
-            };
-          } catch {
-            return null;
-          }
-        });
-        // Wildcard data-testid match, e.g. data-testid*="new-tag"
-        attempts.push(async () => {
-          try {
-            const selector = `[data-testid*="${escapedSlug}"]`;
-            log(
-              "[discovery] trying data-testid contains",
-              JSON.stringify({ name, slug, selector })
-            );
-            const base = target.locator(selector);
-            const loc = toSingle(base);
-            await loc.waitFor({ state: "visible", timeout });
-            log(
-              "[discovery] matched by data-testid contains",
-              JSON.stringify({ name, slug, selector })
-            );
-            return {
-              stored: selector,
-              locator: loc,
-              clickLocator: loc,
-              fillLocator: loc,
-            };
-          } catch {
-            return null;
-          }
-        });
-      }
-
-      // Icon buttons (e.g. + icon, arrow-up icon): match by data-icon on element or descendant.
-      // Map common icon-name phrases to specific icon slugs (e.g. "+" -> "plus", "arrow up" -> "arrow-up");
-      // otherwise derive the slug directly from the name.
+    // icon button (data-icon)
+    if (clickOrHover) {
       const iconNameNorm = name.trim().toLowerCase();
       const iconSlug =
-        // "+" icon variants.
         /^\s*\+\s*$|^\s*\+\s*icon\s*$|^\s*plus\s*icon\s*$|^\s*plus\s*$/.test(iconNameNorm)
           ? "plus"
-          // "arrow up" icon variants (e.g. "arrow up", "arrow-up icon", "up arrow icon").
           : /^(arrow[-\s]*up|up[-\s]*arrow)(\s*icon\s*)?$/.test(iconNameNorm)
-          ? "arrow-up"
-          // Fallback: use the generic slug from the name if it isn't too generic, or normalize the raw name.
-          : (slugTooGeneric ? "" : slug) ||
+            ? "arrow-up"
+            : (slugTooGeneric ? "" : slug) ||
             iconNameNorm.replace(/\s+/g, "-").replace(/[^a-z0-9_-]/g, "");
       const iconSlugTooGeneric = iconSlug === "icon" || iconSlug === "-icon";
       if (iconSlug && !iconSlugTooGeneric) {
         const escapedIcon = escapeForAttrSelector(iconSlug);
-        // Prefer the clickable container (button) that contains the icon.
         attempts.push(async () => {
           try {
             const selector = `button:has([data-icon="${escapedIcon}"])`;
             log(
-              "[discovery] trying button with data-icon",
+              "[discovery] [tier3] trying button with data-icon",
               JSON.stringify({ name, iconSlug, selector })
             );
             const base = target.locator(selector);
             const loc = toSingle(base);
             await loc.waitFor({ state: "visible", timeout });
             log(
-              "[discovery] matched by button with data-icon",
+              "[discovery] [tier3] matched by button with data-icon",
               JSON.stringify({ name, iconSlug, selector })
             );
             return {
@@ -481,19 +701,18 @@ async function tryResolveInTarget(
             return null;
           }
         });
-        // Fallback: the icon element itself (e.g. svg[data-icon="plus"]); click often bubbles to button.
         attempts.push(async () => {
           try {
             const selector = `[data-icon="${escapedIcon}"]`;
             log(
-              "[discovery] trying data-icon element",
+              "[discovery] [tier3] trying data-icon element",
               JSON.stringify({ name, iconSlug, selector })
             );
             const base = target.locator(selector);
             const loc = toSingle(base);
             await loc.waitFor({ state: "visible", timeout });
             log(
-              "[discovery] matched by data-icon element",
+              "[discovery] [tier3] matched by data-icon element",
               JSON.stringify({ name, iconSlug, selector })
             );
             return {
@@ -506,19 +725,18 @@ async function tryResolveInTarget(
             return null;
           }
         });
-        // Icon slug contains (e.g. data-icon*="plus" for Font Awesome–style attributes).
         attempts.push(async () => {
           try {
             const selector = `button:has([data-icon*="${escapedIcon}"])`;
             log(
-              "[discovery] trying button with data-icon contains",
+              "[discovery] [tier3] trying button with data-icon contains",
               JSON.stringify({ name, iconSlug, selector })
             );
             const base = target.locator(selector);
             const loc = toSingle(base);
             await loc.waitFor({ state: "visible", timeout });
             log(
-              "[discovery] matched by button with data-icon contains",
+              "[discovery] [tier3] matched by button with data-icon contains",
               JSON.stringify({ name, iconSlug, selector })
             );
             return {
@@ -532,25 +750,21 @@ async function tryResolveInTarget(
           }
         });
       }
-    }
 
-    if (tryPreferredRoleFirst) {
+      // button+hasText block (non-preferred but text-based)
       attempts.push(async () => {
         try {
-          log(
-            "[discovery] trying role+regex (preferred)",
-            JSON.stringify({
-              role: preferredRole,
-              name,
-              pattern: nameRegex.source,
-            })
+          const textRegex = new RegExp(
+            name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+"),
+            "i"
           );
-          const base = target.getByRole(preferredRole as "button", { name: nameRegex });
-          const loc = toSingle(base);
+          log("[discovery] [tier3] trying button+hasText", JSON.stringify({ name }));
+          const buttonLoc = target.getByRole("button").filter({ hasText: textRegex });
+          const loc = toSingle(buttonLoc);
           await loc.waitFor({ state: "visible", timeout });
-          log("[discovery] matched by role+regex (preferred)");
+          log("[discovery] [tier3] matched by button+hasText", JSON.stringify({ name }));
           return {
-            stored: serializeRoleLocator(preferredRole, name, elementIndex),
+            stored: serializeRoleLocator("button", name, elementIndex),
             locator: loc,
             clickLocator: loc,
             fillLocator: loc,
@@ -559,64 +773,21 @@ async function tryResolveInTarget(
           return null;
         }
       });
-      attempts.push(async () => {
-        try {
-          log(
-            "[discovery] trying role+name (preferred)",
-            JSON.stringify({ role: preferredRole, pattern: ciRegex.source })
-          );
-          const base = target.getByRole(preferredRole as "button", { name: ciRegex });
-          const loc = toSingle(base);
-          await loc.waitFor({ state: "visible", timeout });
-          log("[discovery] matched by role+name (preferred)");
-          return {
-            stored: serializeRoleLocator(preferredRole, name, elementIndex),
-            locator: loc,
-            clickLocator: loc,
-            fillLocator: loc,
-          };
-        } catch {
-          return null;
-        }
-      });
-      if (clickOrHover) {
-        attempts.push(async () => {
-          try {
-            log(
-              "[discovery] trying role+hasText (preferred)",
-              JSON.stringify({ role: preferredRole, pattern: ciRegex.source })
-            );
-            const roleLoc = target
-              .getByRole(preferredRole as "button")
-              .filter({ hasText: ciRegex });
-            const loc = toSingle(roleLoc);
-            await loc.waitFor({ state: "visible", timeout });
-            log("[discovery] matched by role+hasText (preferred)");
-            return {
-              stored: serializeRoleLocator(preferredRole, name, elementIndex),
-              locator: loc,
-              clickLocator: loc,
-              fillLocator: loc,
-            };
-          } catch {
-            return null;
-          }
-        });
-      }
     }
 
-    for (const role of roles) {
+    //** tier 4: non-preferred role fallbacks **
+    for (const role of roles.filter((r) => r !== preferredRole)) {
       const r = role;
       attempts.push(async () => {
         try {
           log(
-            "[discovery] trying role+regex",
+            "[discovery] [tier4] trying role+regex",
             JSON.stringify({ role: r, name, pattern: nameRegex.source })
           );
           const base = target.getByRole(r as "button", { name: nameRegex });
           const loc = toSingle(base);
           await loc.waitFor({ state: "visible", timeout });
-          log("[discovery] matched by role+regex", JSON.stringify({ role: r, name }));
+          log("[discovery] [tier4] matched by role+regex", JSON.stringify({ role: r, name }));
           return {
             stored: serializeRoleLocator(r, name, elementIndex),
             locator: loc,
@@ -627,171 +798,15 @@ async function tryResolveInTarget(
           return null;
         }
       });
-    }
-
-    for (const role of roles) {
-      const r = role;
-      const ci = new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
       attempts.push(async () => {
         try {
-          log(
-            "[discovery] trying role+name",
-            JSON.stringify({ role: r, pattern: ci.source })
-          );
-          const base = target.getByRole(r as "button", { name: ci });
+          log("[discovery] [tier4] trying role+name", JSON.stringify({ role: r, pattern: ciRegex.source }));
+          const base = target.getByRole(r as "button", { name: ciRegex });
           const loc = toSingle(base);
           await loc.waitFor({ state: "visible", timeout });
-          log("[discovery] matched by role+name", JSON.stringify({ role: r, name }));
+          log("[discovery] [tier4] matched by role+name", JSON.stringify({ role: r, name }));
           return {
             stored: serializeRoleLocator(r, name, elementIndex),
-            locator: loc,
-            clickLocator: loc,
-            fillLocator: loc,
-          };
-        } catch {
-          return null;
-        }
-      });
-    }
-
-    if (clickOrHover) {
-      for (const name of namesToTry) {
-        const n = name;
-        attempts.push(async () => {
-          try {
-            const textRegex = new RegExp(
-              n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+"),
-              "i"
-            );
-            const buttonLoc = target.getByRole("button").filter({ hasText: textRegex });
-            const loc = toSingle(buttonLoc);
-            await loc.waitFor({ state: "visible", timeout });
-            log("[discovery] matched by button+hasText", JSON.stringify({ name }));
-            return {
-              stored: serializeRoleLocator("button", name, elementIndex),
-              locator: loc,
-              clickLocator: loc,
-              fillLocator: loc,
-            };
-          } catch {
-            return null;
-          }
-        });
-      }
-    }
-  }
-
-  const elementText = element;
-  const shouldTryTextInputForClick =
-    (action === "click" || action === "dblclick") &&
-    typeof elementText === "string" &&
-    /\b(input|field|dropdown)\b/i.test(elementText);
-
-  if (action !== "fill" && action !== "select") {
-    for (const name of namesToTry) {
-      const n = name;
-      attempts.push(async () => {
-        try {
-          const nameRegex = new RegExp(n.replace(/\s+/g, "\\s+"), "i");
-          const loc = target.getByPlaceholder(nameRegex).first();
-          await loc.waitFor({ state: "visible", timeout });
-          log("[discovery] matched by placeholder", JSON.stringify({ name: n }));
-          return {
-            stored: `${PLACEHOLDER_PREFIX}${n}`,
-            locator: loc,
-            clickLocator: loc,
-            fillLocator: loc,
-          };
-        } catch {
-          return null;
-        }
-      });
-    }
-    for (const name of namesToTry) {
-      const n = name;
-      attempts.push(async () => {
-        try {
-          const nameRegex = new RegExp(n.replace(/\s+/g, "\\s+"), "i");
-          const loc = target.getByLabel(nameRegex).first();
-          await loc.waitFor({ state: "visible", timeout });
-          log("[discovery] matched by label", JSON.stringify({ name: n }));
-          return {
-            stored: `${LABEL_PREFIX}${n}`,
-            locator: loc,
-            clickLocator: loc,
-            fillLocator: loc,
-          };
-        } catch {
-          return null;
-        }
-      });
-    }
-  }
-
-  if (shouldTryTextInputForClick) {
-    for (const name of namesToTry) {
-      const n = name;
-      attempts.push(async () => {
-        try {
-          const labelLike = target.getByText(n, { exact: false });
-          const container = labelLike.locator(
-            "xpath=parent::*[.//input or .//textarea or .//*[@contenteditable='true']][1]"
-          );
-          const inputLike = container
-            .locator("input, textarea, [contenteditable='true']")
-            .filter({ visible: true });
-          const input = inputLike.first();
-          await input.waitFor({ state: "visible", timeout });
-          log(
-            "[discovery] matched by text+descendant-input",
-            JSON.stringify({ name: n })
-          );
-          return {
-            stored: `${TEXT_INPUT_PREFIX}${n}`,
-            locator: input,
-            clickLocator: container.first(),
-            fillLocator: input,
-          };
-        } catch {
-          return null;
-        }
-      });
-    }
-  }
-
-  if (action === "click" || action === "hover" || action === "dblclick") {
-    for (const name of namesToTry) {
-      const n = name;
-      attempts.push(async () => {
-        try {
-          const textRegex = new RegExp(
-            n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+"),
-            "i"
-          );
-          const loc = target.getByText(textRegex, { exact: true }).first();
-          await loc.waitFor({ state: "visible", timeout });
-          log("[discovery] matched by text-exact", JSON.stringify({ name: n }));
-          return {
-            stored: `${TEXT_PREFIX}${n}`,
-            locator: loc,
-            clickLocator: loc,
-            fillLocator: loc,
-          };
-        } catch {
-          return null;
-        }
-      });
-      attempts.push(async () => {
-        try {
-          const ciContains = new RegExp(
-            n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
-            "i"
-          );
-          const loc = target.getByText(ciContains).first();
-          await loc.waitFor({ state: "visible", timeout });
-          log("[discovery] matched by text", JSON.stringify({ name: n }));
-          return {
-            stored: `${TEXT_PREFIX}${n}`,
             locator: loc,
             clickLocator: loc,
             fillLocator: loc,
@@ -855,6 +870,7 @@ export async function resolveLocator(
     const fillOrSelect = action === "fill" || action === "select";
     const looksStored =
       selector.startsWith(ROLE_PREFIX) ||
+      selector.startsWith(ALT_PREFIX) ||
       selector.startsWith(PLACEHOLDER_PREFIX) ||
       selector.startsWith(LABEL_PREFIX) ||
       selector.startsWith(TEXT_PREFIX) ||
@@ -984,7 +1000,7 @@ export async function resolveLocator(
   // When "inside dialog" only (no iframe): resolve within dialog on main page (role="dialog" or .dialog).
   if (preferredInDialog && !preferredInIframe) {
     const dialogTarget = getDialogLocator(page);
-    const result = await tryResolveInTarget(
+    const result = await tryResolveInTargetTiers(
       dialogTarget,
       stepForResolve,
       namesToTry,
@@ -1031,7 +1047,7 @@ export async function resolveLocator(
         // continue; frame might still be usable
       }
       const dialogTarget = getDialogLocator(frame);
-      const result = await tryResolveInTarget(
+      const result = await tryResolveInTargetTiers(
         dialogTarget,
         stepForResolve,
         namesToTry,
@@ -1060,7 +1076,7 @@ export async function resolveLocator(
 
   if (tryMainFirst) {
     // Try main page first, then iframes
-    let result = await tryResolveInTarget(
+    let result = await tryResolveInTargetTiers(
       page,
       stepForResolve,
       namesToTry,
@@ -1075,7 +1091,7 @@ export async function resolveLocator(
 
     for (const frame of page.frames()) {
       if (frame === page.mainFrame()) continue;
-      result = await tryResolveInTarget(
+      result = await tryResolveInTargetTiers(
         frame,
         stepForResolve,
         namesToTry,
@@ -1113,7 +1129,7 @@ export async function resolveLocator(
         if (e instanceof Error && e.message === "Stopped") throw e;
         // continue; frame might still be usable
       }
-      const result = await tryResolveInTarget(
+      const result = await tryResolveInTargetTiers(
         frame,
         stepForResolve,
         namesToTry,
@@ -1138,7 +1154,7 @@ export async function resolveLocator(
       }
     }
 
-    const result = await tryResolveInTarget(
+    const result = await tryResolveInTargetTiers(
       page,
       stepForResolve,
       namesToTry,
@@ -1176,6 +1192,14 @@ function applyStoredLocatorToTarget(
       numericLast && parts.length >= 3 ? parseInt(last, 10) : 0;
     const base = target.getByRole(role as "button", { name: name || undefined });
     return index > 0 ? base.nth(index) : base.first();
+  }
+  if (stored.startsWith(ALT_PREFIX)) {
+    // Stored form is a logical string derived from a matched alt.
+    // Use a flexible regex to tolerate whitespace and casing differences.
+    const alt = stored.slice(ALT_PREFIX.length);
+    const escaped = alt.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+");
+    const altRegex = new RegExp(escaped, "i");
+    return target.getByAltText(altRegex).first();
   }
   if (stored.startsWith(PLACEHOLDER_PREFIX)) {
     return target

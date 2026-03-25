@@ -9,14 +9,36 @@
 export function getDebugRecorderScript(): string {
   return `
 (function() {
-  var RECORDER_VERSION = 5;
+  var RECORDER_VERSION = 7;
   if (window.__uiplayRecorderV === RECORDER_VERSION) return;
   if (typeof window.__uiplayRecorderTeardown === 'function') {
     try { window.__uiplayRecorderTeardown(); } catch (e) {}
   }
   window.__uiplayRecorderV = RECORDER_VERSION;
   window.__inIframe = (window !== window.top);
-  var actions = [];
+  var IS_TOP = (window === window.top);
+  var STORAGE_KEY = '__uiplay_recordedActions_v1';
+  function loadPersisted() {
+    if (!IS_TOP) return [];
+    try {
+      var raw = window.sessionStorage && window.sessionStorage.getItem(STORAGE_KEY);
+      if (!raw) return [];
+      var parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (e) {
+      return [];
+    }
+  }
+  function persist(actions) {
+    try {
+      if (!IS_TOP) return;
+      if (!window.sessionStorage) return;
+      window.sessionStorage.setItem(STORAGE_KEY, JSON.stringify(actions));
+    } catch (e) {}
+  }
+
+  // Persist actions so fast navigations (e.g. submit) don't lose records before the poll loop reads.
+  var actions = loadPersisted();
 
   function cssEscapeId(id) {
     if (window.CSS && CSS.escape) return CSS.escape(id);
@@ -280,6 +302,7 @@ export function getDebugRecorderScript(): string {
       });
       if (source === 'pointerdown') lastPointerClickDedupe = { sel: sel, t: now };
       else lastPointerClickDedupe = { sel: '', t: 0 };
+      persist(actions);
       return;
     }
     actions.push({
@@ -291,6 +314,7 @@ export function getDebugRecorderScript(): string {
     });
     if (source === 'pointerdown') lastPointerClickDedupe = { sel: sel, t: now };
     else lastPointerClickDedupe = { sel: '', t: 0 };
+    persist(actions);
   }
 
   function onWindowPointerDown(e) {
@@ -298,15 +322,11 @@ export function getDebugRecorderScript(): string {
     pushClickLikeRecord(e, Date.now(), 'pointerdown');
   }
 
-  function onWindowClick(e) {
-    pushClickLikeRecord(e, Date.now(), 'click');
-  }
-
-  // pointerdown runs synchronously before navigation unloads the document; click may not fire.
+  // Record click-like actions on pointerdown only:
+  // - pointerdown runs synchronously before navigation unloads the document; click may not fire.
+  // - recording both pointerdown + click can misclassify single clicks as double clicks
+  //   when the follow-up click arrives outside the small dedupe window.
   window.addEventListener('pointerdown', onWindowPointerDown, true);
-  // Capture on window so we run before document-level handlers (sites that
-  // stopImmediatePropagation on document can still leave window uncancelled).
-  window.addEventListener('click', onWindowClick, true);
 
   function onDocumentInput(e) {
     var t = e.target;
@@ -333,6 +353,7 @@ export function getDebugRecorderScript(): string {
         timestamp: now
       });
     }
+    persist(actions);
   }
 
   document.addEventListener('input', onDocumentInput, true);
@@ -349,13 +370,13 @@ export function getDebugRecorderScript(): string {
       value: t.value,
       timestamp: Date.now()
     });
+    persist(actions);
   }
 
   document.addEventListener('change', onDocumentChange, true);
 
   window.__uiplayRecorderTeardown = function() {
     window.removeEventListener('pointerdown', onWindowPointerDown, true);
-    window.removeEventListener('click', onWindowClick, true);
     document.removeEventListener('input', onDocumentInput, true);
     document.removeEventListener('change', onDocumentChange, true);
     delete window.__uiplayRecorderTeardown;

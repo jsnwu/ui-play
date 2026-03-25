@@ -8,10 +8,19 @@ import { getUiplayConfig } from "./uiplay-config";
 const frameworkDir = path.resolve(__dirname, "..");
 export const rootDir = path.resolve(frameworkDir, "..");
 
-loadDotenv({ path: path.join(rootDir, ".env") });
-loadDotenv({ path: path.join(rootDir, "browser", ".env") });
-
 const ui = getUiplayConfig();
+
+const envFiles =
+  (ui.paths as { envFiles?: string[] }).envFiles ??
+  // Back-compat: allow older config.json to keep envFiles at the top level.
+  (ui as unknown as { envFiles?: string[] }).envFiles ??
+  [];
+
+for (const envFile of envFiles) {
+  const p = (envFile ?? "").trim();
+  if (!p) continue;
+  loadDotenv({ path: path.isAbsolute(p) ? p : path.join(rootDir, p) });
+}
 
 export const FRAMEWORK_DIR = frameworkDir;
 export const TESTS_DIR = path.resolve(rootDir, ui.paths.tests);

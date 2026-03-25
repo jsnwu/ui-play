@@ -65,7 +65,12 @@ export async function runEstablished(options: EstablishedRunOptions): Promise<{
 
   const timeouts = getUiplayConfig().timeouts;
 
-  const browser = await chromium.launch({ headless: options.headless ?? false });
+  const cfg = getUiplayConfig();
+  const browser = await chromium.launch({
+    headless: options.headless ?? false,
+    ...(cfg.browser.channel ? { channel: cfg.browser.channel as any } : {}),
+    ...(Array.isArray(cfg.browser.args) && cfg.browser.args.length ? { args: cfg.browser.args } : {}),
+  });
   const contextOptions = await getPlaywrightBrowserContextOptions();
   const context = await browser.newContext(contextOptions);
   const page = await context.newPage();

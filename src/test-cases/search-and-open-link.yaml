@@ -4,8 +4,8 @@ test_case:
   established: true
   baseUrl: "{{ENV:BASE_URL}}"
   actions:
-    - Navigate to https://www.duckduckgo.com/
+    - Navigate to {{baseUrl}}
     - Click Search with DuckDuckGo dropdown with locator '#searchbox_input'
-    - Fill "Search with DuckDuckGo dropdown" with "Claude Code" with locator '#searchbox_input'
+    - Fill "Search with DuckDuckGo dropdown" with "jsnwu github" with locator '#searchbox_input'
     - Click Search button
-    - Click Claude Code by Anthropic link
+    - Click jsnwu (Jason Wu) link

@@ -6,7 +6,7 @@ This framework turns plain-text step lines into runnable tests:
 1. **Write steps** in YAML (or create a test with `init-test`). Steps use action keywords and optional variables.
 2. **Debug** opens an interactive UI to run steps one-by-one, add/edit steps, set breakpoints, and save.
 3. **Discovery** runs the flow in Playwright and records locators into a page object. Once it succeeds, the test is marked established.
-4. **Run** executes established tests using page objects only (no exploration).
+4. **Run** executes established tests using page objects only (fast).
 
 
 ## Setup
@@ -14,11 +14,29 @@ This framework turns plain-text step lines into runnable tests:
 - **Node**: Use the repo’s existing `npm install`.
 - **Playwright**: `npx playwright install`
 
+## Configuration (`src/config.json`)
+
+Runtime settings live in **`src/config.json`** and are read by `src/engine/uiplay-config.ts`.
+
+- **Paths**: directories are configurable under `paths` (tests, page objects, upload files).
+- **Dotenv**: dotenv files are configurable under `paths.envFiles` (relative to repo root unless absolute). Default is:
+
+```json
+{
+  "paths": {
+    "envFiles": [".env", ".env.example"]
+  }
+}
+```
+
 ## Commands
 
 All commands are run via the CLI (from repo root):
 
 ```bash
+# Run debug mode to build test case
+npm run uiplay:debug    
+
 # Create a test case from step lines
 npm run uiplay -- init-test my-test "My flow" "Navigate to {{baseUrl}}" "Click Sign in" "Fill Email with test@example.com"
 
@@ -102,6 +120,11 @@ Run **`npm run uiplay -- debug <testId>`** to open the interactive debug UI. You
 - **Steps table**: Edit action, element, value, and optional dialog/iframe flags per step. Run a single step (▶), set breakpoints (○/●), move or delete steps.
 - **Log panel**: Execution and resolver output. Clear and expand/collapse without interrupting a run.
 
+### Highlight + Record performance notes
+
+- **Highlight**: hover + playback outlining is only enabled while **Run step / Run all / Resume** is actively executing. When idle, highlight listeners are detached to avoid background CPU/GPU usage.
+- **Record**: recording injects capture listeners only while recording is active and tears them down on Stop recording / Reset to avoid leaving expensive `input` handlers attached.
+
 All of the **action keywords** in the table above can be used when adding or editing steps in the debug UI. The debug runner supports these step actions (same as discovery/run):
 
 | Action | Use in debug UI |
@@ -145,9 +168,18 @@ If `baseUrl` is empty or `{{baseUrl}}`, the runner uses `PLAYWRIGHT_LOGIN_URL` f
 
 ## Directory layout
 
-- **`uiplay/page-objects/`** – Page objects in YAML (one `.yaml` file per page/flow). Each has **`locators`** (logical name → Playwright locator string) and optional **`aliases`** (alternative key → canonical key in `locators`). Existing `.json` page objects are still loaded if no `.yaml` exists for the same id.
-- **`uiplay/tests/`** – Test cases in YAML: `test_case` at root with `actions` (step lines) and optional `variables`.
-- **`uiplay/recordings/`** – Raw recordings (if using record/translate flows elsewhere).
+- **Tests / page objects / upload files**: locations are configured by `src/config.json` under `paths` (see `paths.tests`, `paths.pageObjects`, `paths.uploadFiles`).
+
+### Stored locator formats (page objects)
+
+Discovery records locators into page objects using stable serialized formats where possible:
+
+- **`role|<role>|<name>`** (or `role|<role>|<name>|<index>`): role-based locators
+- **`alt|<altText>`**: match by alt text (images / icon buttons)
+- **`placeholder|<text>`**, **`label|<text>`**, **`text|<text>`**, **`text_input|<text>`**
+- **`file_input|`** for uploads
+- **`frame|...|...`** / **`dialog|...`** for scoped locators
+
 
 ## Flow summary
 
